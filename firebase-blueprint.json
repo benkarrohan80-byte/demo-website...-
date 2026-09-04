@@ -1,0 +1,30 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile document stored in Firestore",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "maxLength": 100 },
+        "email": { "type": "string", "maxLength": 100 },
+        "role": { "type": "string", "enum": ["admin", "user"] },
+        "diamonds": { "type": "number" },
+        "inGameId": { "type": "string", "maxLength": 50 },
+        "totalEarnings": { "type": "number" },
+        "matchesPlayed": { "type": "number" },
+        "wins": { "type": "number" },
+        "kdRatio": { "type": "number" },
+        "tier": { "type": "string", "maxLength": 50 },
+        "avatar": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "maxLength": 50 }
+      },
+      "required": ["name", "email"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profile records"
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "name": "Shadow X Tournament",
+  "description": "Join Shadow Queen's custom rooms and tournaments, complete challenges, earn diamonds, and redeem exciting rewards.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
