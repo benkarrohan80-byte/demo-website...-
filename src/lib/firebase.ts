@@ -97,18 +97,9 @@ export const auth = authInstance as Auth;
 export const db = dbInstance as Firestore;
 
 /**
- * PERSIST USER DIAMONDS & PROFILE DATA TO FIRESTORE & LOCAL STORAGE
+ * PERSIST USER DIAMONDS & PROFILE DATA TO FIRESTORE ONLY (Single Source of Truth)
  */
 export async function persistUserDiamonds(userId: string, newDiamonds: number, totalEarnings?: number): Promise<void> {
-  try {
-    localStorage.setItem(`sq_diamonds_${userId}`, String(newDiamonds));
-    if (totalEarnings !== undefined) {
-      localStorage.setItem(`sq_earnings_${userId}`, String(totalEarnings));
-    }
-  } catch (e) {
-    console.warn('localStorage save warning:', e);
-  }
-
   if (db) {
     try {
       const userDocRef = doc(db, 'users', userId);
@@ -127,26 +118,6 @@ export async function persistUserDiamonds(userId: string, newDiamonds: number, t
 }
 
 export async function persistUserProfile(userId: string, updates: Partial<User>): Promise<void> {
-  try {
-    if (updates.diamonds !== undefined) {
-      localStorage.setItem(`sq_diamonds_${userId}`, String(updates.diamonds));
-    }
-    if (updates.totalEarnings !== undefined) {
-      localStorage.setItem(`sq_earnings_${userId}`, String(updates.totalEarnings));
-    }
-    if (updates.avatar !== undefined) {
-      localStorage.setItem(`sq_avatar_${userId}`, updates.avatar);
-    }
-    if (updates.name !== undefined) {
-      localStorage.setItem(`sq_name_${userId}`, updates.name);
-    }
-    if (updates.inGameId !== undefined) {
-      localStorage.setItem(`sq_ingameid_${userId}`, updates.inGameId);
-    }
-  } catch (e) {
-    console.warn('localStorage save warning:', e);
-  }
-
   if (db) {
     try {
       const userDocRef = doc(db, 'users', userId);
@@ -198,6 +169,28 @@ export async function resetAccountToFresh(userId: string): Promise<Partial<User>
         tier: 'Grandmaster',
         updatedAt: serverTimestamp()
       });
+
+      // Clear existing transactions for user and add initial Welcome Bonus transaction
+      const txQuery = query(collection(db, 'diamondTransactions'), where('userId', '==', userId));
+      const txSnap = await getDocs(txQuery);
+      const batchDelete = writeBatch(db);
+      txSnap.forEach((d) => {
+        batchDelete.delete(d.ref);
+      });
+      await batchDelete.commit();
+
+      // Create permanent Welcome Bonus transaction
+      const welcomeTxRef = doc(collection(db, 'diamondTransactions'));
+      await setDoc(welcomeTxRef, {
+        userId,
+        userName: 'Gamer',
+        type: 'Earn',
+        category: 'welcome_bonus',
+        amountDiamonds: 30,
+        description: 'Welcome Bonus Signup Reward',
+        timestamp: new Date().toISOString(),
+        status: 'Success'
+      });
     } catch (e) {
       console.warn('Firestore reset account error:', e);
     }
@@ -212,7 +205,7 @@ export async function resetAccountToFresh(userId: string): Promise<Partial<User>
 export async function syncUserProfile(fbUser: FirebaseUser): Promise<User> {
   // Check if auto-reset is needed for this user session
   const isTargetUser = fbUser.email?.toLowerCase() === 'benkarrohan80@gmail.com' || fbUser.email?.toLowerCase() === 'shadowyesports1@gmail.com';
-  const autoResetKey = `shadowx_auto_reset_v3_${fbUser.uid}`;
+  const autoResetKey = `shadowx_auto_reset_v5_${fbUser.uid}`;
   if (isTargetUser && localStorage.getItem(autoResetKey) !== 'completed') {
     localStorage.setItem(autoResetKey, 'completed');
     await resetAccountToFresh(fbUser.uid);
@@ -266,50 +259,14 @@ export async function syncUserProfile(fbUser: FirebaseUser): Promise<User> {
   const userDocRef = doc(db, 'users', fbUser.uid);
   
   try {
-    // Wrap with timeout to guarantee immediate, non-blocking UI response during offline / reconnecting state
-    const fetchDoc = getDoc(userDocRef);
-    const timeout = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('Firestore connection timeout')), 3500)
-    );
-    const userSnap = await Promise.race([fetchDoc, timeout]);
+    const userSnap = await getDoc(userDocRef);
     if (userSnap.exists()) {
       const data = userSnap.data();
-      let userDiamonds = typeof data.diamonds === 'number' ? data.diamonds : 30;
-      let userEarnings = typeof data.totalEarnings === 'number' ? data.totalEarnings : 0;
-      let userAvatar = data.avatar || fallbackAvatar;
-      let userName = data.name || fallbackName;
-      let userInGameId = data.inGameId || fallbackInGameId;
-
-      // Preserve any claimed/earned diamonds from user's wallet
-      if (cachedDiamonds !== null && cachedDiamonds > userDiamonds) {
-        userDiamonds = cachedDiamonds;
-        updateDoc(userDocRef, { diamonds: userDiamonds }).catch(() => {});
-      } else {
-        try {
-          localStorage.setItem(`sq_diamonds_${fbUser.uid}`, String(userDiamonds));
-        } catch {}
-      }
-
-      if (cachedEarnings !== null && cachedEarnings > userEarnings) {
-        userEarnings = cachedEarnings;
-        updateDoc(userDocRef, { totalEarnings: userEarnings }).catch(() => {});
-      } else {
-        try {
-          localStorage.setItem(`sq_earnings_${fbUser.uid}`, String(userEarnings));
-        } catch {}
-      }
-
-      // Sync custom profile details back into localStorage
-      try {
-        localStorage.setItem(`sq_avatar_${fbUser.uid}`, userAvatar);
-        localStorage.setItem(`sq_name_${fbUser.uid}`, userName);
-        localStorage.setItem(`sq_ingameid_${fbUser.uid}`, userInGameId);
-      } catch {}
-
-      // Call referral progress if they have claimed a code
-      if (data.hasClaimedReferral) {
-        updateReferralProgress(fbUser.uid, { emailVerified: fbUser.emailVerified }).catch(e => console.warn('Referral update failed', e));
-      }
+      const userDiamonds = typeof data.diamonds === 'number' ? data.diamonds : 30;
+      const userEarnings = typeof data.totalEarnings === 'number' ? data.totalEarnings : 0;
+      const userAvatar = data.avatar || fallbackAvatar;
+      const userName = data.name || fallbackName;
+      const userInGameId = data.inGameId || fallbackInGameId;
 
       return {
         id: fbUser.uid,
@@ -332,7 +289,7 @@ export async function syncUserProfile(fbUser: FirebaseUser): Promise<User> {
     } else {
       // First-time profile creation: 30 welcome diamonds
       const userRole: 'admin' | 'user' = (fbUser.email?.toLowerCase() === 'benkarrohan80@gmail.com' || fbUser.email?.toLowerCase() === 'admin@shadowx.com' || fbUser.email?.toLowerCase() === 'shadowyesports1@gmail.com') ? 'admin' : 'user';
-      const initialDiamonds = cachedDiamonds !== null ? cachedDiamonds : 30;
+      const initialDiamonds = 30;
       const initialProfile = {
         name: fallbackName,
         email: fbUser.email || '',
@@ -340,7 +297,7 @@ export async function syncUserProfile(fbUser: FirebaseUser): Promise<User> {
         role: userRole,
         diamonds: initialDiamonds,
         inGameId: fallbackInGameId,
-        totalEarnings: cachedEarnings !== null ? cachedEarnings : 0,
+        totalEarnings: 0,
         matchesPlayed: 0,
         wins: 0,
         kdRatio: 4.2,
@@ -350,12 +307,19 @@ export async function syncUserProfile(fbUser: FirebaseUser): Promise<User> {
         hasClaimedReferral: false
       };
       await setDoc(userDocRef, { ...initialProfile, updatedAt: serverTimestamp() }).catch(() => {});
-      try {
-        localStorage.setItem(`sq_diamonds_${fbUser.uid}`, String(initialDiamonds));
-        localStorage.setItem(`sq_avatar_${fbUser.uid}`, fallbackAvatar);
-        localStorage.setItem(`sq_name_${fbUser.uid}`, fallbackName);
-        localStorage.setItem(`sq_ingameid_${fbUser.uid}`, fallbackInGameId);
-      } catch {}
+
+      // Create initial welcome transaction
+      const welcomeTxRef = doc(collection(db, 'diamondTransactions'));
+      await setDoc(welcomeTxRef, {
+        userId: fbUser.uid,
+        userName: fallbackName,
+        type: 'Earn',
+        category: 'welcome_bonus',
+        amountDiamonds: 30,
+        description: 'Welcome Bonus Signup Reward',
+        timestamp: new Date().toISOString(),
+        status: 'Success'
+      });
 
       return {
         id: fbUser.uid,
@@ -775,4 +739,52 @@ export async function claimDailyBonusSecurely(userId: string, amount: number, is
     console.error('Error in claimDailyBonusSecurely:', err);
     return { success: false, error: err.message || 'Failed to claim daily bonus' };
   }
+}
+
+/**
+ * Subscribe to real-time user profile updates (Single Source of Truth)
+ */
+export function subscribeToUserProfile(userId: string, onUpdate: (user: User) => void): () => void {
+  if (!db) return () => {};
+  const userRef = doc(db, 'users', userId);
+  return onSnapshot(userRef, (docSnap) => {
+    if (docSnap.exists()) {
+      const data = docSnap.data();
+      onUpdate({
+        id: docSnap.id,
+        name: data.name || 'Gamer',
+        email: data.email || '',
+        avatar: data.avatar || FF_IMAGES.characterKelly,
+        role: data.role || 'user',
+        diamonds: typeof data.diamonds === 'number' ? data.diamonds : 30,
+        inGameId: data.inGameId || '',
+        totalEarnings: typeof data.totalEarnings === 'number' ? data.totalEarnings : 0,
+        matchesPlayed: data.matchesPlayed || 0,
+        wins: data.wins || 0,
+        kdRatio: data.kdRatio || 4.2,
+        tier: data.tier || 'Grandmaster',
+        createdAt: data.createdAt || '',
+        isVerified: data.isVerified || false,
+        referralCode: data.referralCode || '',
+        hasClaimedReferral: data.hasClaimedReferral || false
+      });
+    }
+  }, (err) => {
+    console.warn('User snapshot error:', err);
+  });
+}
+
+/**
+ * Subscribe to real-time diamond transactions for user (Single Source of Truth)
+ */
+export function subscribeToTransactions(userId: string, onUpdate: (txs: any[]) => void): () => void {
+  if (!db) return () => {};
+  const q = query(collection(db, 'diamondTransactions'), where('userId', '==', userId));
+  return onSnapshot(q, (snapshot) => {
+    const list = snapshot.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) }));
+    list.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+    onUpdate(list);
+  }, (err) => {
+    console.warn('Transactions snapshot error:', err);
+  });
 }

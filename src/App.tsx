@@ -11,7 +11,7 @@ import { WithdrawPage } from './pages/WithdrawPage';
 import { EarnDiamondsPage } from './pages/EarnDiamondsPage';
 import { ProfilePage } from './pages/ProfilePage';
 import { FF_IMAGES } from './assets/freeFireAssets';
-import { auth, syncUserProfile, logoutFirebase, persistUserDiamonds, persistUserProfile, resetAccountToFresh, fetchAllUsers, applyReferralCode, fetchDiamondTransactions, claimDailyBonusSecurely } from './lib/firebase';
+import { auth, syncUserProfile, logoutFirebase, persistUserDiamonds, persistUserProfile, resetAccountToFresh, fetchAllUsers, applyReferralCode, fetchDiamondTransactions, claimDailyBonusSecurely, subscribeToUserProfile, subscribeToTransactions } from './lib/firebase';
 import { onAuthStateChanged } from 'firebase/auth';
 
 export default function App() {
@@ -48,35 +48,18 @@ export default function App() {
       return;
     }
 
-    const unsubscribe = onAuthStateChanged(auth, async (fbUser) => {
+    const unsubscribeAuth = onAuthStateChanged(auth, async (fbUser) => {
       if (fbUser) {
         try {
           const userProfile = await syncUserProfile(fbUser);
           setCurrentUser(userProfile);
           setUsers(prev => prev.some(u => u.id === userProfile.id) ? prev : [userProfile, ...prev]);
 
-          // Load persistent data for this user
-          const savedTx = localStorage.getItem(`sq_tx_${fbUser.uid}`);
-          let localTx: Transaction[] = savedTx ? JSON.parse(savedTx) : [];
-          
-          // Fetch backend transactions (e.g., referral rewards) and merge
-          const backendTx = await fetchDiamondTransactions(fbUser.uid);
-          if (backendTx && backendTx.length > 0) {
-            const merged = [...backendTx, ...localTx];
-            // Remove duplicates by ID and sort
-            const uniqueTx = Array.from(new Map(merged.map(item => [item.id, item])).values());
-            uniqueTx.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-            setTransactions(uniqueTx);
-          } else if (localTx.length > 0) {
-            setTransactions(localTx);
-          }
-          
           const savedReg = localStorage.getItem(`sq_reg_${fbUser.uid}`);
           if (savedReg) setRegistrations(JSON.parse(savedReg));
 
           const savedNotif = localStorage.getItem(`sq_notif_${fbUser.uid}`);
           if (savedNotif) setNotifications(JSON.parse(savedNotif));
-
         } catch (e) {
           console.error('Error syncing user profile:', e);
         }
@@ -86,8 +69,26 @@ export default function App() {
       setAuthInitializing(false);
     });
 
-    return () => unsubscribe();
+    return () => unsubscribeAuth();
   }, []);
+
+  // Real-time Firestore snapshot listeners for live synchronization across devices and tabs
+  useEffect(() => {
+    if (!currentUser) return;
+
+    const unsubUser = subscribeToUserProfile(currentUser.id, (updatedUser) => {
+      setCurrentUser(prev => prev ? { ...prev, diamonds: updatedUser.diamonds, totalEarnings: updatedUser.totalEarnings } : updatedUser);
+    });
+
+    const unsubTx = subscribeToTransactions(currentUser.id, (txs) => {
+      setTransactions(txs);
+    });
+
+    return () => {
+      unsubUser();
+      unsubTx();
+    };
+  }, [currentUser?.id]);
 
   // Save activity when it changes
   useEffect(() => {
