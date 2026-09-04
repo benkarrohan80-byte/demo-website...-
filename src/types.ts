@@ -18,6 +18,25 @@ export interface User {
   tier: 'Grandmaster' | 'Challenger' | 'Apex Predator' | 'Immortal';
   createdAt: string;
   isVerified?: boolean;
+  referralCode?: string;
+  hasClaimedReferral?: boolean;
+  lastDailyClaimAt?: string;
+}
+
+export interface Referral {
+  id: string;
+  referrerId: string;
+  referredUserId: string;
+  referredUserName: string;
+  referralCode: string;
+  createdAt: string;
+  progress: {
+    emailVerified: boolean;
+    dailyBonusCount: number;
+    customRoomsPlayed: number;
+    rewardUnlocked: boolean;
+    rewardPaid: boolean;
+  };
 }
 
 export interface Tournament {

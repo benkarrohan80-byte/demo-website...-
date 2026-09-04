@@ -11,7 +11,7 @@ import { WithdrawPage } from './pages/WithdrawPage';
 import { EarnDiamondsPage } from './pages/EarnDiamondsPage';
 import { ProfilePage } from './pages/ProfilePage';
 import { FF_IMAGES } from './assets/freeFireAssets';
-import { auth, syncUserProfile, logoutFirebase, persistUserDiamonds, persistUserProfile, resetAccountToFresh, fetchAllUsers } from './lib/firebase';
+import { auth, syncUserProfile, logoutFirebase, persistUserDiamonds, persistUserProfile, resetAccountToFresh, fetchAllUsers, applyReferralCode, fetchDiamondTransactions, claimDailyBonusSecurely } from './lib/firebase';
 import { onAuthStateChanged } from 'firebase/auth';
 
 export default function App() {
@@ -54,6 +54,29 @@ export default function App() {
           const userProfile = await syncUserProfile(fbUser);
           setCurrentUser(userProfile);
           setUsers(prev => prev.some(u => u.id === userProfile.id) ? prev : [userProfile, ...prev]);
+
+          // Load persistent data for this user
+          const savedTx = localStorage.getItem(`sq_tx_${fbUser.uid}`);
+          let localTx: Transaction[] = savedTx ? JSON.parse(savedTx) : [];
+          
+          // Fetch backend transactions (e.g., referral rewards) and merge
+          const backendTx = await fetchDiamondTransactions(fbUser.uid);
+          if (backendTx && backendTx.length > 0) {
+            const merged = [...backendTx, ...localTx];
+            // Remove duplicates by ID and sort
+            const uniqueTx = Array.from(new Map(merged.map(item => [item.id, item])).values());
+            uniqueTx.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+            setTransactions(uniqueTx);
+          } else if (localTx.length > 0) {
+            setTransactions(localTx);
+          }
+          
+          const savedReg = localStorage.getItem(`sq_reg_${fbUser.uid}`);
+          if (savedReg) setRegistrations(JSON.parse(savedReg));
+
+          const savedNotif = localStorage.getItem(`sq_notif_${fbUser.uid}`);
+          if (savedNotif) setNotifications(JSON.parse(savedNotif));
+
         } catch (e) {
           console.error('Error syncing user profile:', e);
         }
@@ -65,6 +88,25 @@ export default function App() {
 
     return () => unsubscribe();
   }, []);
+
+  // Save activity when it changes
+  useEffect(() => {
+    if (currentUser && transactions.length > 0 && transactions !== INITIAL_TRANSACTIONS) {
+      localStorage.setItem(`sq_tx_${currentUser.id}`, JSON.stringify(transactions));
+    }
+  }, [transactions, currentUser]);
+
+  useEffect(() => {
+    if (currentUser && registrations.length > 0 && registrations !== INITIAL_REGISTRATIONS) {
+      localStorage.setItem(`sq_reg_${currentUser.id}`, JSON.stringify(registrations));
+    }
+  }, [registrations, currentUser]);
+
+  useEffect(() => {
+    if (currentUser && notifications.length > 0 && notifications !== INITIAL_NOTIFICATIONS) {
+      localStorage.setItem(`sq_notif_${currentUser.id}`, JSON.stringify(notifications));
+    }
+  }, [notifications, currentUser]);
 
   // Load all registered users from Firestore for the Admin Portal if current user is admin
   useEffect(() => {
@@ -245,6 +287,13 @@ export default function App() {
     // Update tournament registered count
     setTournaments(tournaments.map(t => t.id === tournament.id ? { ...t, registeredCount: t.registeredCount + 1 } : t));
 
+    // Update referral progress
+    if (currentUser.hasClaimedReferral) {
+      import('./lib/firebase').then(m => {
+        m.updateReferralProgress(currentUser.id, { incrementRoom: true }).catch(e => console.warn('Referral update failed', e));
+      });
+    }
+
     // Add notification
     const newNotif: NotificationItem = {
       id: `notif_${Date.now()}`,
@@ -260,16 +309,28 @@ export default function App() {
     setNotifications([newNotif, ...notifications]);
   };
 
-  const handleClaimDailyBonus = (dayIndex: number, amount: number) => {
+  const handleClaimDailyBonus = async (dayIndex: number, amount: number) => {
     if (!currentUser) return;
-    const newDiamonds = currentUser.diamonds + amount;
-    const newEarnings = (currentUser.totalEarnings || 0) + amount;
-    const updatedUser = { ...currentUser, diamonds: newDiamonds, totalEarnings: newEarnings };
+    const isLuckySpin = dayIndex === 99;
+
+    const res = await claimDailyBonusSecurely(currentUser.id, amount, isLuckySpin);
+    if (!res.success) {
+      alert(res.error || 'Failed to claim daily bonus.');
+      return;
+    }
+
+    const newDiamonds = res.newDiamonds !== undefined ? res.newDiamonds : currentUser.diamonds + amount;
+    const newEarnings = res.newEarnings !== undefined ? res.newEarnings : (currentUser.totalEarnings || 0) + amount;
+    
+    const updatedUser = { 
+      ...currentUser, 
+      diamonds: newDiamonds, 
+      totalEarnings: newEarnings,
+      lastDailyClaimAt: !isLuckySpin ? new Date().toISOString() : currentUser.lastDailyClaimAt
+    };
     setCurrentUser(updatedUser);
     setUsers(users.map(u => u.id === updatedUser.id ? updatedUser : u));
-    persistUserDiamonds(currentUser.id, newDiamonds, newEarnings);
 
-    const isLuckySpin = dayIndex === 99;
     const newTx: Transaction = {
       id: `tx_${Date.now()}`,
       userId: currentUser.id,
@@ -297,6 +358,13 @@ export default function App() {
       type: 'earn'
     };
     setNotifications([newNotif, ...notifications]);
+
+    // Update referral progress
+    if (!isLuckySpin && currentUser.hasClaimedReferral) {
+      import('./lib/firebase').then(m => {
+        m.updateReferralProgress(currentUser.id, { incrementDaily: true }).catch(e => console.warn('Referral update failed', e));
+      });
+    }
   };
 
   const handleCompleteTask = (taskId: string, rewardDiamonds: number) => {
@@ -325,13 +393,15 @@ export default function App() {
     setTransactions([newTx, ...transactions]);
   };
 
-  const handleApplyReferralCode = (code: string) => {
-    if (!currentUser) return false;
-    if (code.startsWith('SHX-')) {
-      const reward = economySettings.referralBonusForFriend;
+  const handleApplyReferralCode = async (code: string) => {
+    if (!currentUser) return { success: false, error: 'Must be logged in' };
+    try {
+      await applyReferralCode(currentUser.id, code);
+      // Wait for it to succeed, then update local state
+      const reward = 5;
       const newDiamonds = currentUser.diamonds + reward;
       const newEarnings = (currentUser.totalEarnings || 0) + reward;
-      const updatedUser = { ...currentUser, diamonds: newDiamonds, totalEarnings: newEarnings };
+      const updatedUser = { ...currentUser, diamonds: newDiamonds, totalEarnings: newEarnings, hasClaimedReferral: true };
       setCurrentUser(updatedUser);
       setUsers(users.map(u => u.id === updatedUser.id ? updatedUser : u));
       persistUserDiamonds(currentUser.id, newDiamonds, newEarnings);
@@ -344,13 +414,14 @@ export default function App() {
         category: 'referral',
         amountDiamonds: reward,
         description: `Applied Referral Code: ${code}`,
-        timestamp: new Date().toLocaleString(),
+        timestamp: new Date().toISOString(),
         status: 'Success'
       };
       setTransactions([newTx, ...transactions]);
-      return true;
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err.message || 'Failed to apply referral code' };
     }
-    return false;
   };
 
   const handleSubmitWithdrawalRequest = (tier: WithdrawalTier, email: string, inGameId: string, _passwordVerify: string) => {
@@ -610,7 +681,7 @@ export default function App() {
         id: `notif_${Date.now()}_${reg.userId}`,
         userId: reg.userId,
         title: '🎮 Tournament Result Announced!',
-        message: `"${t.title}" match complete ho gaya hai! Winner: ${winner.name} 🏆. Matches Played aapki profile me update ho gaya hai.`,
+        message: `The match "${t.title}" is complete! Winner: ${winner.name} 🏆. Matches Played has been updated in your profile.`,
         timestamp: 'Just now',
         read: false,
         type: 'tournament'

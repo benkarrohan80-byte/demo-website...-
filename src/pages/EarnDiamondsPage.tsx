@@ -1,10 +1,11 @@
-import React, { useState } from 'react';
-import { User, PlatformTask, EconomySettings } from '../types';
+import React, { useState, useEffect } from 'react';
+import { User, PlatformTask, EconomySettings, Referral } from '../types';
 import { 
   Sparkles, Calendar, Play, CheckCircle2, Gift, Share2, Copy, Trophy, 
-  ExternalLink, Clock, Flame, ShieldCheck, ArrowRight, Zap, Star, ChevronRight, Check, RotateCcw, Lock
+  ExternalLink, Clock, Flame, ShieldCheck, ArrowRight, Zap, Star, ChevronRight, Check, RotateCcw, Lock, XCircle, AlertCircle, ScrollText, Info
 } from 'lucide-react';
 import { FF_IMAGES } from '../assets/freeFireAssets';
+import { subscribeToMyReferrals } from '../lib/firebase';
 
 interface EarnDiamondsPageProps {
   currentUser: User | null;
@@ -12,7 +13,7 @@ interface EarnDiamondsPageProps {
   economySettings: EconomySettings;
   onClaimDailyBonus: (dayIndex: number, amount: number) => void;
   onCompleteTask: (taskId: string, rewardDiamonds: number) => void;
-  onApplyReferralCode: (code: string) => boolean;
+  onApplyReferralCode: (code: string) => Promise<{success: boolean; error?: string}>;
   onOpenAuth: () => void;
   setActiveTab: (tab: string) => void;
 }
@@ -147,10 +148,35 @@ export const EarnDiamondsPage: React.FC<EarnDiamondsPageProps> = ({
   const [completedTaskIds, setCompletedTaskIds] = useState<string[]>([]);
   const [inProgressTask, setInProgressTask] = useState<{ id: string; secondsLeft: number } | null>(null);
 
+  // Load completed tasks from local storage
+  React.useEffect(() => {
+    if (currentUser) {
+      const ls = localStorage.getItem(`shadowx_tasks_${currentUser.id}`);
+      if (ls) {
+        setCompletedTaskIds(JSON.parse(ls));
+      } else {
+        setCompletedTaskIds([]);
+      }
+    }
+  }, [currentUser?.id]);
+
   // Referral code state
   const [friendRefCode, setFriendRefCode] = useState('');
   const [refMsg, setRefMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [copiedLink, setCopiedLink] = useState(false);
+  const [myReferrals, setMyReferrals] = useState<Referral[]>([]);
+
+  useEffect(() => {
+    let unsubscribe = () => {};
+    if (currentUser) {
+      unsubscribe = subscribeToMyReferrals(currentUser.id, (list) => {
+        setMyReferrals(list);
+      });
+    } else {
+      setMyReferrals([]);
+    }
+    return () => unsubscribe();
+  }, [currentUser]);
 
   // Weekly Booyah Lucky Wheel state (1 spin per week)
   const [spinDegree, setSpinDegree] = useState(0);
@@ -195,12 +221,23 @@ export const EarnDiamondsPage: React.FC<EarnDiamondsPageProps> = ({
       onOpenAuth();
       return;
     }
+    const todayStr = getTodayDateStr();
+    const userId = currentUser.id;
+    const raw = localStorage.getItem(`shadowx_streak_data_${userId}`);
+    if (raw) {
+      const data = JSON.parse(raw);
+      if (data.lastDateStr === todayStr) return; // Prevent double tap glitch
+    }
+
+    // Security guard: Ensure they are only claiming today's specific streak day
+    if (dayIndex !== streakData.currentStreakDay || streakData.hasClaimedToday) {
+      return; 
+    }
+
     const reward = economySettings.dailyCheckinRewards[dayIndex] ?? 5;
     onClaimDailyBonus(dayIndex, reward);
 
     const newStreak = dayIndex + 1; // 1 to 7
-    const todayStr = getTodayDateStr();
-    const userId = currentUser.id;
 
     localStorage.setItem(
       `shadowx_streak_data_${userId}`,
@@ -266,10 +303,22 @@ export const EarnDiamondsPage: React.FC<EarnDiamondsPageProps> = ({
       onOpenAuth();
       return;
     }
+    
+    // Prevent double claim and check local storage
+    const lsKey = `shadowx_tasks_${currentUser.id}`;
+    const saved = JSON.parse(localStorage.getItem(lsKey) || '[]');
+    if (saved.includes(task.id) || completedTaskIds.includes(task.id)) return;
 
     if (task.actionUrl) {
       window.open(task.actionUrl, '_blank');
     }
+
+    const saveCompletion = () => {
+      const updated = [...saved, task.id];
+      localStorage.setItem(lsKey, JSON.stringify(updated));
+      setCompletedTaskIds(prev => [...prev, task.id]);
+      onCompleteTask(task.id, task.rewardDiamonds);
+    };
 
     if (task.verificationType === 'timer' && task.timerSeconds) {
       setInProgressTask({ id: task.id, secondsLeft: task.timerSeconds });
@@ -280,37 +329,36 @@ export const EarnDiamondsPage: React.FC<EarnDiamondsPageProps> = ({
         if (remaining <= 0) {
           clearInterval(interval);
           setInProgressTask(null);
-          setCompletedTaskIds(prev => [...prev, task.id]);
-          onCompleteTask(task.id, task.rewardDiamonds);
+          saveCompletion();
         }
       }, 1000);
     } else {
       // Instant verification
-      setCompletedTaskIds(prev => [...prev, task.id]);
-      onCompleteTask(task.id, task.rewardDiamonds);
+      saveCompletion();
     }
   };
 
   const handleCopyReferral = () => {
-    const code = currentUser ? `SHX-${currentUser.inGameId || currentUser.id}` : 'SHX-VIPER2026';
+    const code = currentUser?.referralCode || 'SHX-VIPER2026';
     const link = `https://shadowx.esports/join?ref=${code}`;
-    navigator.clipboard.writeText(link);
+    navigator.clipboard.writeText(code);
     setCopiedLink(true);
     setTimeout(() => setCopiedLink(false), 2500);
   };
 
-  const handleApplyReferral = (e: React.FormEvent) => {
+  const handleApplyReferral = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!currentUser) {
       onOpenAuth();
       return;
     }
-    const ok = onApplyReferralCode(friendRefCode.trim());
-    if (ok) {
-      setRefMsg({ text: `Referral code applied! +${economySettings.referralBonusForFriend} Welcome Diamonds credited.`, type: 'success' });
+    setRefMsg(null);
+    const result = await onApplyReferralCode(friendRefCode.trim());
+    if (result.success) {
+      setRefMsg({ text: `Referral code applied! +5 Welcome Diamonds credited.`, type: 'success' });
       setFriendRefCode('');
     } else {
-      setRefMsg({ text: 'Invalid referral code or already used.', type: 'error' });
+      setRefMsg({ text: result.error || 'Invalid referral code or already used.', type: 'error' });
     }
   };
 
@@ -389,7 +437,7 @@ export const EarnDiamondsPage: React.FC<EarnDiamondsPageProps> = ({
     });
   }, [tasks, selectedCategory]);
 
-  const referralCode = currentUser ? `SHX-${currentUser.inGameId || currentUser.id}` : 'SHX-VIPER2026';
+  const referralCode = currentUser?.referralCode || 'SHX-VIPER2026';
 
   return (
     <div className="min-h-screen bg-[#090a0f] text-white py-6 sm:py-10 px-3 sm:px-6 lg:px-8 relative overflow-hidden">
@@ -540,30 +588,9 @@ export const EarnDiamondsPage: React.FC<EarnDiamondsPageProps> = ({
               <span>Day 1 (5💎) → Day 2 (5💎) → Day 3 (10💎) → Day 4 (15💎) → Day 5 (20💎) → Day 6 (30💎) → Day 7 (50💎). Miss a day = Reset to Day 1.</span>
             </div>
 
-            {/* Quick Test / Simulation Buttons for User */}
+            {/* Streak Rule summary info */}
             <div className="flex items-center space-x-2 shrink-0">
-              <button
-                onClick={() => simulateStreakCondition('next_day')}
-                title="Advance date to tomorrow to test next day claim"
-                className="px-2.5 py-1 rounded-lg bg-purple-900/60 border border-purple-500/30 text-purple-300 text-[11px] font-semibold hover:bg-purple-800/80 transition-all flex items-center space-x-1"
-              >
-                <span>⏩ Sim Next Day</span>
-              </button>
-              <button
-                onClick={() => simulateStreakCondition('miss_day')}
-                title="Simulate missing a day to verify reset to Day 1"
-                className="px-2.5 py-1 rounded-lg bg-amber-900/60 border border-amber-500/30 text-amber-300 text-[11px] font-semibold hover:bg-amber-800/80 transition-all flex items-center space-x-1"
-              >
-                <span>⚠️ Sim Miss Day</span>
-              </button>
-              <button
-                onClick={() => simulateStreakCondition('reset')}
-                title="Reset streak to start"
-                className="px-2.5 py-1 rounded-lg bg-slate-800 border border-slate-700 text-gray-400 text-[11px] font-semibold hover:bg-slate-700 transition-all flex items-center space-x-1"
-              >
-                <RotateCcw className="w-3 h-3" />
-                <span>Reset</span>
-              </button>
+              <span className="text-gray-400">Claimable once every 24 hours securely.</span>
             </div>
           </div>
         </div>
@@ -750,7 +777,7 @@ export const EarnDiamondsPage: React.FC<EarnDiamondsPageProps> = ({
                   {isSpinning 
                     ? 'Spinning Wheel...' 
                     : hasSpunThisWeek 
-                    ? `Locked (Next Spin in ${daysUntilNextSpin} Day${daysUntilNextSpin > 1 ? 's' : ''})` 
+                    ? 'Locked' 
                     : 'Spin Booyah Wheel Now'}
                 </span>
               </button>
@@ -760,7 +787,7 @@ export const EarnDiamondsPage: React.FC<EarnDiamondsPageProps> = ({
                 <div className="w-full mt-2.5 px-3 py-2 rounded-xl bg-purple-950/40 border border-purple-500/20 flex items-center justify-center space-x-2 text-[11px] text-purple-300 text-center">
                   <Clock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
                   <span>
-                    Weekly Limit: Week me 1 bar spin allowed. Agla spin <strong className="text-amber-300 font-bold">{daysUntilNextSpin} din</strong> baad unlock hoga.
+                    Weekly Limit: 1 spin allowed per week. Next spin unlocks in <strong className="text-amber-300 font-bold">{daysUntilNextSpin} day{daysUntilNextSpin > 1 ? 's' : ''}</strong>.
                   </span>
                 </div>
               )}
@@ -965,6 +992,169 @@ export const EarnDiamondsPage: React.FC<EarnDiamondsPageProps> = ({
                   Apply Code & Claim +{economySettings.referralBonusForFriend} 💎
                 </button>
               </form>
+            </div>
+            
+            {/* Referral Progress Tracking Dashboard */}
+            {currentUser && myReferrals.length > 0 && (
+              <div className="lg:col-span-12 mt-6 space-y-6">
+                
+                {/* Dashboard Summary Cards */}
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                  <div className="bg-slate-950/80 border border-slate-800 p-4 rounded-2xl flex flex-col items-center justify-center text-center">
+                    <div className="text-gray-400 mb-1"><span className="text-[10px] uppercase font-bold tracking-wider">Total Referrals</span></div>
+                    <div className="text-2xl font-black text-white">{myReferrals.length}</div>
+                  </div>
+                  <div className="bg-slate-950/80 border border-amber-500/20 p-4 rounded-2xl flex flex-col items-center justify-center text-center">
+                    <div className="text-amber-400/80 mb-1"><span className="text-[10px] uppercase font-bold tracking-wider">Active</span></div>
+                    <div className="text-2xl font-black text-amber-400">{myReferrals.filter(r => (r as any).status !== 'Completed').length}</div>
+                  </div>
+                  <div className="bg-slate-950/80 border border-emerald-500/20 p-4 rounded-2xl flex flex-col items-center justify-center text-center">
+                    <div className="text-emerald-400/80 mb-1"><span className="text-[10px] uppercase font-bold tracking-wider">Completed</span></div>
+                    <div className="text-2xl font-black text-emerald-400">{myReferrals.filter(r => (r as any).status === 'Completed').length}</div>
+                  </div>
+                  <div className="bg-slate-950/80 border border-purple-500/30 p-4 rounded-2xl flex flex-col items-center justify-center text-center shadow-[0_0_15px_rgba(168,85,247,0.1)]">
+                    <div className="text-purple-300 mb-1"><span className="text-[10px] uppercase font-bold tracking-wider">Diamonds Earned</span></div>
+                    <div className="text-2xl font-black text-white">+{myReferrals.filter(r => (r as any).status === 'Completed').length * 50} <span className="text-lg">💎</span></div>
+                  </div>
+                </div>
+
+                {/* My Referrals Progress List */}
+                <div className="bg-slate-950/80 border border-purple-500/30 p-6 rounded-2xl">
+                  <h3 className="text-sm font-bold text-white uppercase tracking-wider mb-4">My Referrals Progress</h3>
+                  <div className="space-y-4">
+                    {myReferrals.map((ref: any) => {
+                      const totalSteps = 15; // 1 (email) + 7 (daily) + 7 (rooms)
+                      const currentSteps = (ref.progress.emailVerified ? 1 : 0) + 
+                                           Math.min(7, ref.progress.dailyBonusCount) + 
+                                           Math.min(7, ref.progress.customRoomsPlayed);
+                      const percent = Math.round((currentSteps / totalSteps) * 100);
+                      
+                      return (
+                        <div key={ref.id} className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col gap-4">
+                          <div className="flex flex-col md:flex-row gap-4 items-center justify-between">
+                            <div>
+                              <h4 className="text-emerald-400 font-bold text-sm">{ref.referredUserName}</h4>
+                              <p className="text-[10px] text-gray-500 mt-1">Code Used: {ref.referralCode}</p>
+                            </div>
+                            
+                            <div className="flex flex-wrap gap-4 items-center">
+                              <div className="flex flex-col items-center">
+                                <span className="text-[10px] text-gray-400 uppercase font-semibold">Email</span>
+                                {ref.progress.emailVerified ? <Check className="w-4 h-4 text-emerald-400 mt-1" /> : <span className="text-xs text-red-400 mt-1 font-bold">✗</span>}
+                              </div>
+                              <div className="w-px h-8 bg-slate-800 hidden sm:block"></div>
+                              <div className="flex flex-col items-center">
+                                <span className="text-[10px] text-gray-400 uppercase font-semibold">Daily Bonus</span>
+                                <span className="text-xs font-bold text-white mt-1">{ref.progress.dailyBonusCount} / 7</span>
+                              </div>
+                              <div className="w-px h-8 bg-slate-800 hidden sm:block"></div>
+                              <div className="flex flex-col items-center">
+                                <span className="text-[10px] text-gray-400 uppercase font-semibold">Custom Rooms</span>
+                                <span className="text-xs font-bold text-white mt-1">{ref.progress.customRoomsPlayed} / 7</span>
+                              </div>
+                              <div className="w-px h-8 bg-slate-800 hidden sm:block"></div>
+                              <div className="flex flex-col items-end">
+                                <span className="text-[10px] text-gray-400 uppercase font-semibold">Reward Status</span>
+                                <span className={`text-xs font-bold mt-1 px-2 py-0.5 rounded-full ${ref.status === 'Completed' ? 'bg-emerald-950/50 text-emerald-400' : 'bg-amber-950/50 text-amber-400'}`}>
+                                  {ref.status === 'Completed' ? 'Completed' : 'Pending'}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                          
+                          {/* Completion Percentage Bar */}
+                          <div className="w-full">
+                            <div className="flex justify-between text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-1.5">
+                              <span>Completion</span>
+                              <span className={percent === 100 ? 'text-emerald-400' : 'text-purple-400'}>{percent}%</span>
+                            </div>
+                            <div className="w-full bg-slate-950 rounded-full h-1.5 overflow-hidden">
+                              <div 
+                                className={`h-full rounded-full transition-all duration-500 ${percent === 100 ? 'bg-emerald-500' : 'bg-gradient-to-r from-purple-600 to-indigo-500'}`}
+                                style={{ width: `${percent}%` }}
+                              ></div>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Referral Rules Section */}
+            <div className="lg:col-span-12 mt-6 bg-slate-950/80 border border-purple-500/30 p-6 rounded-2xl">
+              <div className="flex items-center space-x-2 mb-6">
+                <ScrollText className="w-5 h-5 text-purple-400" />
+                <h3 className="text-lg font-black text-white uppercase tracking-wider">Referral Rules</h3>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                
+                {/* Rewards & Verification */}
+                <div className="space-y-4">
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
+                    <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Rewards</h4>
+                    <div className="flex items-start space-x-3">
+                      <Gift className="w-5 h-5 text-purple-400 shrink-0 mt-0.5" />
+                      <p className="text-sm text-gray-300">New users get <strong className="text-purple-300">5 Diamonds instantly</strong> after applying a valid referral code.</p>
+                    </div>
+                    <div className="flex items-start space-x-3">
+                      <Gift className="w-5 h-5 text-purple-400 shrink-0 mt-0.5" />
+                      <p className="text-sm text-gray-300">Referrer receives <strong className="text-amber-400">50 Diamonds</strong> only after all conditions are completed.</p>
+                    </div>
+                  </div>
+
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
+                    <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">System Verification</h4>
+                    <div className="flex items-start space-x-3">
+                      <AlertCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+                      <p className="text-sm text-gray-300">Referral rewards are automatically verified by the system before being credited.</p>
+                    </div>
+                    <div className="flex items-start space-x-3">
+                      <Sparkles className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
+                      <p className="text-sm text-gray-300">Once all requirements are completed, <strong className="text-amber-400">50 Diamonds</strong> are automatically added to the referrer's account.</p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Conditions & Restrictions */}
+                <div className="space-y-4">
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
+                    <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Required Conditions</h4>
+                    <div className="flex items-start space-x-3">
+                      <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
+                      <p className="text-sm text-gray-300">Email must be verified.</p>
+                    </div>
+                    <div className="flex items-start space-x-3">
+                      <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
+                      <p className="text-sm text-gray-300">Daily bonus must be collected for 7 consecutive days.</p>
+                    </div>
+                    <div className="flex items-start space-x-3">
+                      <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
+                      <p className="text-sm text-gray-300">At least 7 custom room tournaments must be played.</p>
+                    </div>
+                  </div>
+
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
+                    <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Restrictions</h4>
+                    <div className="flex items-start space-x-3">
+                      <XCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+                      <p className="text-sm text-gray-300">Self-referrals are not allowed.</p>
+                    </div>
+                    <div className="flex items-start space-x-3">
+                      <XCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+                      <p className="text-sm text-gray-300">A referral code can only be used once per account.</p>
+                    </div>
+                    <div className="flex items-start space-x-3">
+                      <XCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+                      <p className="text-sm text-gray-300">Duplicate referral rewards are not allowed.</p>
+                    </div>
+                  </div>
+                </div>
+
+              </div>
             </div>
 
           </div>

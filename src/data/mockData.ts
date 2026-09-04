@@ -345,7 +345,7 @@ export const INITIAL_ECONOMY_SETTINGS: EconomySettings = {
   dailyCheckinRewards: [5, 5, 10, 15, 20, 30, 50],
   watchAdReward: 15,
   referralReward: 50,
-  referralBonusForFriend: 25,
+  referralBonusForFriend: 5,
   dailyAdLimit: 10,
   withdrawalTiers: DEFAULT_WITHDRAWAL_TIERS,
 };

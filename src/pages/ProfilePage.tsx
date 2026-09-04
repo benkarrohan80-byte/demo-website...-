@@ -143,7 +143,7 @@ export const ProfilePage: React.FC<ProfilePageProps> = ({
     ? Math.round((currentUser.wins / currentUser.matchesPlayed) * 100) 
     : 0;
 
-  const referralCode = `SHX-${currentUser.inGameId.replace(/[^a-zA-Z0-9]/g, '').slice(-4).toUpperCase() || 'PRO9'}-${currentUser.id.slice(-4).toUpperCase()}`;
+  const referralCode = currentUser.referralCode || 'SHX-VIPER2026';
 
   const handleCopyUID = () => {
     navigator.clipboard.writeText(currentUser.inGameId);

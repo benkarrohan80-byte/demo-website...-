@@ -22,6 +22,11 @@ import {
   collection,
   getDocs,
   serverTimestamp, 
+  query,
+  where,
+  runTransaction,
+  increment,
+  onSnapshot,
   Firestore 
 } from 'firebase/firestore';
 import { User } from '../types';
@@ -207,7 +212,7 @@ export async function resetAccountToFresh(userId: string): Promise<Partial<User>
 export async function syncUserProfile(fbUser: FirebaseUser): Promise<User> {
   // Check if auto-reset is needed for this user session
   const isTargetUser = fbUser.email?.toLowerCase() === 'benkarrohan80@gmail.com' || fbUser.email?.toLowerCase() === 'shadowyesports1@gmail.com';
-  const autoResetKey = `shadowx_auto_reset_v2_${fbUser.uid}`;
+  const autoResetKey = `shadowx_auto_reset_v3_${fbUser.uid}`;
   if (isTargetUser && localStorage.getItem(autoResetKey) !== 'completed') {
     localStorage.setItem(autoResetKey, 'completed');
     await resetAccountToFresh(fbUser.uid);
@@ -301,6 +306,11 @@ export async function syncUserProfile(fbUser: FirebaseUser): Promise<User> {
         localStorage.setItem(`sq_ingameid_${fbUser.uid}`, userInGameId);
       } catch {}
 
+      // Call referral progress if they have claimed a code
+      if (data.hasClaimedReferral) {
+        updateReferralProgress(fbUser.uid, { emailVerified: fbUser.emailVerified }).catch(e => console.warn('Referral update failed', e));
+      }
+
       return {
         id: fbUser.uid,
         name: userName,
@@ -315,7 +325,9 @@ export async function syncUserProfile(fbUser: FirebaseUser): Promise<User> {
         kdRatio: data.kdRatio ?? 4.2,
         tier: data.tier || 'Grandmaster',
         createdAt: data.createdAt || new Date().toISOString().split('T')[0],
-        isVerified: fbUser.emailVerified
+        isVerified: fbUser.emailVerified,
+        referralCode: data.referralCode || 'SQ' + fbUser.uid.substring(0, 6).toUpperCase(),
+        hasClaimedReferral: data.hasClaimedReferral || false
       };
     } else {
       // First-time profile creation: 30 welcome diamonds
@@ -334,6 +346,8 @@ export async function syncUserProfile(fbUser: FirebaseUser): Promise<User> {
         kdRatio: 4.2,
         tier: 'Grandmaster' as const,
         createdAt: new Date().toISOString().split('T')[0],
+        referralCode: 'SQ' + Math.random().toString(36).substring(2, 8).toUpperCase(),
+        hasClaimedReferral: false
       };
       await setDoc(userDocRef, { ...initialProfile, updatedAt: serverTimestamp() }).catch(() => {});
       try {
@@ -368,7 +382,9 @@ export async function syncUserProfile(fbUser: FirebaseUser): Promise<User> {
     kdRatio: 4.2,
     tier: 'Grandmaster',
     createdAt: new Date().toISOString().split('T')[0],
-    isVerified: fbUser.emailVerified
+    isVerified: fbUser.emailVerified,
+    referralCode: 'SQ' + fbUser.uid.substring(0, 6).toUpperCase(),
+    hasClaimedReferral: false
   };
 }
 
@@ -411,7 +427,9 @@ export async function signUpWithFirebase(
         tier: 'Grandmaster',
         avatar: FF_IMAGES.characterKelly,
         createdAt: new Date().toISOString().split('T')[0],
-        updatedAt: serverTimestamp()
+        updatedAt: serverTimestamp(),
+        referralCode: 'SQ' + Math.random().toString(36).substring(2, 8).toUpperCase(),
+        hasClaimedReferral: false
       });
     } catch (e) {
       console.warn('Firestore user save warning:', e);
@@ -500,6 +518,23 @@ export async function fetchAllUsers(): Promise<User[]> {
 }
 
 /**
+ * FETCH DIAMOND TRANSACTIONS FROM FIRESTORE
+ */
+export async function fetchDiamondTransactions(userId: string): Promise<any[]> {
+  if (!db) return [];
+  try {
+    const q = query(collection(db, 'diamondTransactions'), where('userId', '==', userId));
+    const snap = await getDocs(q);
+    // Sort descending by timestamp
+    const list = snap.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) }));
+    return list.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+  } catch (e) {
+    console.error('Error fetching diamond transactions:', e);
+    return [];
+  }
+}
+
+/**
  * Convert Firebase Auth Error codes into user-friendly message
  */
 export function getFirebaseErrorMessage(error: any): string {
@@ -526,5 +561,218 @@ export function getFirebaseErrorMessage(error: any): string {
       return 'Network error. Please check your connection.';
     default:
       return error.message?.replace('Firebase: ', '') || 'Authentication error occurred.';
+  }
+}
+
+/**
+ * APPLY REFERRAL CODE (User applies someone else's code)
+ */
+export async function applyReferralCode(currentUserId: string, referralCode: string): Promise<void> {
+  if (!db) throw new Error("Firestore not initialized.");
+
+  // Fetch referrer by code
+  const usersColl = collection(db, 'users');
+  const q = query(usersColl, where('referralCode', '==', referralCode));
+  const referrerSnap = await getDocs(q);
+  if (referrerSnap.empty) {
+    throw new Error("Invalid referral code.");
+  }
+  const referrerDoc = referrerSnap.docs[0];
+  const referrerId = referrerDoc.id;
+
+  if (referrerId === currentUserId) {
+    throw new Error("You cannot use your own referral code.");
+  }
+
+  await runTransaction(db, async (transaction) => {
+    const userRef = doc(db, 'users', currentUserId);
+    const currentUserDoc = await transaction.get(userRef);
+    if (!currentUserDoc.exists()) throw new Error("User not found");
+    const userData = currentUserDoc.data();
+
+    if (userData.hasClaimedReferral) {
+      throw new Error("You have already used a referral code.");
+    }
+
+    // Give user 5 diamonds and mark as claimed
+    transaction.update(userRef, {
+      hasClaimedReferral: true,
+      diamonds: increment(5)
+    });
+
+    // Create diamond transaction for referred user
+    const txRef = doc(collection(db, 'diamondTransactions'));
+    transaction.set(txRef, {
+      userId: currentUserId,
+      userName: userData.name || 'Gamer',
+      type: 'Earn',
+      category: 'referral',
+      amountDiamonds: 5,
+      description: `Used referral code ${referralCode}`,
+      timestamp: new Date().toISOString(),
+      status: 'Success'
+    });
+
+    // Create referral relationship
+    const refDocRef = doc(db, 'referrals', currentUserId);
+    transaction.set(refDocRef, {
+      referrerId: referrerId,
+      referredUserId: currentUserId,
+      referredUserName: userData.name || 'Gamer',
+      referralCode: referralCode,
+      createdAt: new Date().toISOString(),
+      progress: {
+        emailVerified: false,
+        dailyBonusCount: 0,
+        customRoomsPlayed: 0,
+        rewardUnlocked: false,
+        rewardPaid: false
+      },
+      status: 'Pending'
+    });
+  });
+}
+
+/**
+ * FETCH MY REFERRALS (For referrer to see who they invited)
+ */
+export async function fetchMyReferrals(userId: string) {
+  if (!db) return [];
+  const q = query(collection(db, 'referrals'), where('referrerId', '==', userId));
+  const snap = await getDocs(q);
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+
+export function subscribeToMyReferrals(userId: string, callback: (referrals: any[]) => void) {
+  if (!db) {
+    callback([]);
+    return () => {};
+  }
+  const q = query(collection(db, 'referrals'), where('referrerId', '==', userId));
+  return onSnapshot(q, (snap) => {
+    const list = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    callback(list);
+  }, (err) => {
+    console.warn("Error listening to referrals:", err);
+    callback([]);
+  });
+}
+
+/**
+ * CHECK AND PROCESS REFERRAL REWARD
+ */
+export async function updateReferralProgress(
+  userId: string, 
+  updates: { emailVerified?: boolean; incrementDaily?: boolean; incrementRoom?: boolean }
+): Promise<void> {
+  if (!db) return;
+  const refDocRef = doc(db, 'referrals', userId);
+  const snap = await getDoc(refDocRef);
+  if (!snap.exists()) return;
+  const data = snap.data();
+  if (data.status === 'Completed') return;
+
+  await runTransaction(db, async (transaction) => {
+    const freshSnap = await transaction.get(refDocRef);
+    if (!freshSnap.exists()) return;
+    const freshData = freshSnap.data();
+    if (freshData.status === 'Completed') return;
+
+    const progress = freshData.progress;
+    if (updates.emailVerified !== undefined) progress.emailVerified = updates.emailVerified;
+    if (updates.incrementDaily) progress.dailyBonusCount = Math.min(7, progress.dailyBonusCount + 1);
+    if (updates.incrementRoom) progress.customRoomsPlayed = Math.min(7, progress.customRoomsPlayed + 1);
+
+    const isComplete = progress.emailVerified && progress.dailyBonusCount >= 7 && progress.customRoomsPlayed >= 7;
+
+    if (isComplete && !progress.rewardPaid) {
+      progress.rewardUnlocked = true;
+      progress.rewardPaid = true;
+      
+      const referrerRef = doc(db, 'users', freshData.referrerId);
+      transaction.update(referrerRef, { diamonds: increment(50) });
+
+      const txRef = doc(collection(db, 'diamondTransactions'));
+      transaction.set(txRef, {
+        userId: freshData.referrerId,
+        userName: 'Referrer', // Can't easily get the referrer name, but it's fine for transactions
+        type: 'Earn',
+        category: 'referral',
+        amountDiamonds: 50,
+        description: `Referral reward for ${freshData.referredUserName} completing requirements`,
+        timestamp: new Date().toISOString(),
+        status: 'Success'
+      });
+
+      transaction.update(refDocRef, { progress, status: 'Completed' });
+    } else {
+      transaction.update(refDocRef, { progress, status: isComplete ? 'Completed' : 'Pending' });
+    }
+  });
+}
+
+/**
+ * SECURELY CLAIM DAILY BONUS WITH 24-HOUR TIMESTAMP CHECK
+ */
+export async function claimDailyBonusSecurely(userId: string, amount: number, isLuckySpin: boolean): Promise<{ success: boolean; newDiamonds?: number; newEarnings?: number; error?: string }> {
+  if (!db) {
+    return { success: true };
+  }
+  try {
+    const userRef = doc(db, 'users', userId);
+    const result = await runTransaction(db, async (transaction) => {
+      const userSnap = await transaction.get(userRef);
+      if (!userSnap.exists()) {
+        throw new Error('User profile not found');
+      }
+      const data = userSnap.data();
+      const lastClaimStr = data.lastDailyClaimAt;
+      const now = new Date();
+
+      if (!isLuckySpin && lastClaimStr) {
+        const lastClaim = new Date(lastClaimStr);
+        const diffHours = (now.getTime() - lastClaim.getTime()) / (1000 * 60 * 60);
+        if (diffHours < 24) {
+          throw new Error('Daily bonus can only be claimed once every 24 hours. Please come back tomorrow!');
+        }
+      }
+
+      const currentDiamonds = typeof data.diamonds === 'number' ? data.diamonds : 30;
+      const currentEarnings = typeof data.totalEarnings === 'number' ? data.totalEarnings : 0;
+      const newDiamonds = currentDiamonds + amount;
+      const newEarnings = currentEarnings + amount;
+
+      const updateData: Record<string, any> = {
+        diamonds: newDiamonds,
+        totalEarnings: newEarnings,
+        updatedAt: serverTimestamp()
+      };
+
+      if (!isLuckySpin) {
+        updateData.lastDailyClaimAt = now.toISOString();
+      }
+
+      transaction.update(userRef, updateData);
+
+      // Create a diamond transaction record
+      const txRef = doc(collection(db, 'diamondTransactions'));
+      transaction.set(txRef, {
+        userId,
+        userName: data.name || 'Gamer',
+        type: 'Earn',
+        category: isLuckySpin ? 'tournament_win' : 'daily_checkin',
+        amountDiamonds: amount,
+        description: isLuckySpin ? `Booyah Lucky Spin Wheel (+${amount} 💎)` : `Daily Check-in Reward`,
+        timestamp: now.toISOString(),
+        status: 'Success'
+      });
+
+      return { newDiamonds, newEarnings };
+    });
+
+    return { success: true, ...result };
+  } catch (err: any) {
+    console.error('Error in claimDailyBonusSecurely:', err);
+    return { success: false, error: err.message || 'Failed to claim daily bonus' };
   }
 }
